@@ -105,7 +105,9 @@ var Mime = (function() {
     if (bestFun) {
       return bestFun();
     } else {
-      var supportedTypes = mimeFuns.map(function(mf) {return mimesByKey[mf[0]].join(', ') || mf[0]});
+      var supportedTypes = mimeFuns.map(function(mf) {
+        return mimesByKey[mf[0]].join(', ') || mf[0];
+      });
       throw(["error","not_acceptable",
         "Content-Type "+(accept||bestKey)+" not supported, try one of: "+supportedTypes.join(', ')]);
     }
@@ -117,7 +119,7 @@ var Mime = (function() {
     provides : provides,
     resetProvides : resetProvides,
     runProvides : runProvides
-  }  
+  };
 })();
 
 
@@ -226,7 +228,7 @@ var Render = (function() {
         resp = maybeWrapResponse(resp);
         resp.headers = resp.headers || {};
         for(var header in startResp) {
-          resp.headers[header] = startResp[header]
+          resp.headers[header] = startResp[header];
         }
         resp.body = chunks.join("") + (resp.body || "");
         resetList();
@@ -282,8 +284,8 @@ var Render = (function() {
     try {
       Mime.resetProvides();
       resetList();
-      head = args[0]
-      req = args[1]
+      var head = args[0];
+      var req = args[1];
       var tail = listFun.apply(ddoc, args);
 
       if (Mime.providesUsed) {

@@ -269,13 +269,25 @@ parse_view_param("", _) ->
 parse_view_param("key", Value) ->
     JsonKey = ?JSON_DECODE(Value),
     [{start_key, JsonKey}, {end_key, JsonKey}];
+% TODO: maybe deprecate startkey_docid
 parse_view_param("startkey_docid", Value) ->
     [{start_docid, ?l2b(Value)}];
+parse_view_param("start_key_doc_id", Value) ->
+    [{start_docid, ?l2b(Value)}];
+% TODO: maybe deprecate endkey_docid
 parse_view_param("endkey_docid", Value) ->
     [{end_docid, ?l2b(Value)}];
+parse_view_param("end_key_doc_id", Value) ->
+    [{end_docid, ?l2b(Value)}];
+% TODO: maybe deprecate startkey
 parse_view_param("startkey", Value) ->
     [{start_key, ?JSON_DECODE(Value)}];
+parse_view_param("start_key", Value) ->
+    [{start_key, ?JSON_DECODE(Value)}];
+% TODO: maybe deprecate endkey
 parse_view_param("endkey", Value) ->
+    [{end_key, ?JSON_DECODE(Value)}];
+parse_view_param("end_key", Value) ->
     [{end_key, ?JSON_DECODE(Value)}];
 parse_view_param("limit", Value) ->
     [{limit, parse_positive_int_param(Value)}];
@@ -325,10 +337,12 @@ warn_on_empty_key_range(#view_query_args{
     case {Dir, couch_view:less_json(StartKey, EndKey)} of
         {fwd, false} ->
             throw({query_parse_error,
-            <<"No rows can match your key range, reverse your startkey and endkey or set descending=true">>});
+            <<"No rows can match your key range, reverse your ",
+                "start_key and end_key or set descending=true">>});
         {rev, true} ->
             throw({query_parse_error,
-            <<"No rows can match your key range, reverse your startkey and endkey or set descending=false">>});
+            <<"No rows can match your key range, reverse your ",
+                "start_key and end_key or set descending=false">>});
         _ -> ok
     end.
 
@@ -358,6 +372,10 @@ validate_view_query(limit, Value, Args) ->
     Args#view_query_args{limit=Value};
 validate_view_query(list, Value, Args) ->
     Args#view_query_args{list=Value};
+validate_view_query(stale, ok, Args) ->
+    Args#view_query_args{stale=ok};
+validate_view_query(stale, update_after, Args) ->
+    Args#view_query_args{stale=update_after};
 validate_view_query(stale, _, Args) ->
     Args;
 validate_view_query(descending, true, Args) ->
@@ -387,6 +405,8 @@ validate_view_query(group_level, Value, Args) ->
     end;
 validate_view_query(inclusive_end, Value, Args) ->
     Args#view_query_args{inclusive_end=Value};
+validate_view_query(reduce, false, Args) ->
+    Args;
 validate_view_query(reduce, _, Args) ->
     case Args#view_query_args.view_type of
     map ->

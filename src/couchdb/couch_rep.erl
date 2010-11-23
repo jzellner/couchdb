@@ -53,8 +53,9 @@
     committed_seq = 0,
 
     stats = nil,
-    doc_ids = nil,
-    rep_doc = nil
+    rep_doc = nil,
+    source_db_update_notifier = nil,
+    target_db_update_notifier = nil
 }).
 
 %% convenience function to do a simple replication from the shell
@@ -129,7 +130,6 @@ do_init([RepId, {PostProps} = RepDoc, UserCtx] = InitArgs) ->
     SourceProps = couch_util:get_value(<<"source">>, PostProps),
     TargetProps = couch_util:get_value(<<"target">>, PostProps),
 
-    DocIds = couch_util:get_value(<<"doc_ids">>, PostProps, nil),
     Continuous = couch_util:get_value(<<"continuous">>, PostProps, false),
     CreateTarget = couch_util:get_value(<<"create_target">>, PostProps, false),
 
@@ -143,40 +143,16 @@ do_init([RepId, {PostProps} = RepDoc, UserCtx] = InitArgs) ->
 
     maybe_set_triggered(RepDoc, RepId),
 
-    case DocIds of
-    List when is_list(List) ->
-        % Fast replication using only a list of doc IDs to replicate.
-        % Replication sessions, checkpoints and logs are not created
-        % since the update sequence number of the source DB is not used
-        % for determining which documents are copied into the target DB.
-        SourceLog = nil,
-        TargetLog = nil,
+    [SourceLog, TargetLog] = find_replication_logs(
+        [Source, Target], RepId, {PostProps}, UserCtx),
+    {StartSeq, History} = compare_replication_logs(SourceLog, TargetLog),
 
-        StartSeq = nil,
-        History = nil,
-
-        ChangesFeed = nil,
-        MissingRevs = nil,
-
-        {ok, Reader} =
-        couch_rep_reader:start_link(self(), Source, DocIds, PostProps);
-
-    _ ->
-        % Replication using the _changes API (DB sequence update numbers).
-
-        [SourceLog, TargetLog] = find_replication_logs(
-            [Source, Target], RepId, {PostProps}, UserCtx),
-    
-        {StartSeq, History} = compare_replication_logs(SourceLog, TargetLog),
-
-        {ok, ChangesFeed} =
+    {ok, ChangesFeed} =
         couch_rep_changes_feed:start_link(self(), Source, StartSeq, PostProps),
-        {ok, MissingRevs} =
+    {ok, MissingRevs} =
         couch_rep_missing_revs:start_link(self(), Target, ChangesFeed, PostProps),
-        {ok, Reader} =
-        couch_rep_reader:start_link(self(), Source, MissingRevs, PostProps)
-    end,
-
+    {ok, Reader} =
+        couch_rep_reader:start_link(self(), Source, MissingRevs, PostProps),
     {ok, Writer} =
     couch_rep_writer:start_link(self(), Target, Reader, PostProps),
 
@@ -213,8 +189,9 @@ do_init([RepId, {PostProps} = RepDoc, UserCtx] = InitArgs) ->
         rep_starttime = httpd_util:rfc1123_date(),
         src_starttime = couch_util:get_value(instance_start_time, SourceInfo),
         tgt_starttime = couch_util:get_value(instance_start_time, TargetInfo),
-        doc_ids = DocIds,
-        rep_doc = RepDoc
+        rep_doc = RepDoc,
+        source_db_update_notifier = source_db_update_notifier(Source),
+        target_db_update_notifier = target_db_update_notifier(Target)
     },
     {ok, State}.
 
@@ -222,7 +199,21 @@ handle_call(get_result, From, #state{complete=true, listeners=[]} = State) ->
     {stop, normal, State#state{listeners=[From]}};
 handle_call(get_result, From, State) ->
     Listeners = State#state.listeners,
-    {noreply, State#state{listeners=[From|Listeners]}}.
+    {noreply, State#state{listeners=[From|Listeners]}};
+
+handle_call(get_source_db, _From, #state{source = Source} = State) ->
+    {reply, {ok, Source}, State};
+
+handle_call(get_target_db, _From, #state{target = Target} = State) ->
+    {reply, {ok, Target}, State}.
+
+handle_cast(reopen_source_db, #state{source = Source} = State) ->
+    {ok, NewSource} = couch_db:reopen(Source),
+    {noreply, State#state{source = NewSource}};
+
+handle_cast(reopen_target_db, #state{target = Target} = State) ->
+    {ok, NewTarget} = couch_db:reopen(Target),
+    {noreply, State#state{target = NewTarget}};
 
 handle_cast(do_checkpoint, State) ->
     {noreply, do_checkpoint(State)};
@@ -282,22 +273,17 @@ terminate(normal, State) ->
 terminate(shutdown, #state{listeners = Listeners} = State) ->
     % continuous replication stopped
     [gen_server:reply(L, {ok, stopped}) || L <- Listeners],
-    do_forced_terminate(State);
+    terminate_cleanup(State);
 
 terminate(Reason, #state{listeners = Listeners} = State) ->
     [gen_server:reply(L, {error, Reason}) || L <- Listeners],
-    do_forced_terminate(State),
+    terminate_cleanup(State),
     update_rep_doc(State#state.rep_doc, [{<<"state">>, <<"error">>}]).
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
 % internal funs
-
-do_forced_terminate(#state{source = Source, target = Target, stats = Stats}) ->
-    ets:delete(Stats),
-    close_db(Target),
-    close_db(Source).
 
 start_replication_server(Replicator) ->
     RepId = element(1, Replicator),
@@ -390,25 +376,6 @@ dbinfo(Db) ->
     {ok, Info} = couch_db:get_db_info(Db),
     Info.
 
-do_terminate(#state{doc_ids=DocIds} = State) when is_list(DocIds) ->
-    #state{
-        listeners = Listeners,
-        rep_starttime = ReplicationStartTime,
-        stats = Stats
-    } = State,
-
-    RepByDocsJson = {[
-        {<<"start_time">>, ?l2b(ReplicationStartTime)},
-        {<<"end_time">>, ?l2b(httpd_util:rfc1123_date())},
-        {<<"docs_read">>, ets:lookup_element(Stats, docs_read, 2)},
-        {<<"docs_written">>, ets:lookup_element(Stats, docs_written, 2)},
-        {<<"doc_write_failures">>,
-            ets:lookup_element(Stats, doc_write_failures, 2)}
-    ]},
-
-    terminate_cleanup(State),
-    [gen_server:reply(L, {ok, RepByDocsJson}) || L <- lists:reverse(Listeners)];
-
 do_terminate(State) ->
     #state{
         checkpoint_history = CheckpointHistory,
@@ -445,13 +412,20 @@ do_terminate(State) ->
         false ->
             [gen_server:reply(R, retry) || R <- OtherListeners]
     end,
+    couch_task_status:update("Finishing"),
     terminate_cleanup(State).
 
-terminate_cleanup(#state{source=Source, target=Target, stats=Stats}) ->
-    couch_task_status:update("Finishing"),
-    close_db(Target),
-    close_db(Source),
-    ets:delete(Stats).
+terminate_cleanup(State) ->
+    close_db(State#state.source),
+    close_db(State#state.target),
+    stop_db_update_notifier(State#state.source_db_update_notifier),
+    stop_db_update_notifier(State#state.target_db_update_notifier),
+    ets:delete(State#state.stats).
+
+stop_db_update_notifier(nil) ->
+    ok;
+stop_db_update_notifier(Notifier) ->
+    couch_db_update_notifier:stop(Notifier).
 
 has_session_id(_SessionId, []) ->
     false;
@@ -659,32 +633,53 @@ do_checkpoint(State) ->
         rep_starttime = ReplicationStartTime,
         src_starttime = SrcInstanceStartTime,
         tgt_starttime = TgtInstanceStartTime,
-        stats = Stats
+        stats = Stats,
+        rep_doc = {RepDoc}
     } = State,
     case commit_to_both(Source, Target, NewSeqNum) of
     {SrcInstanceStartTime, TgtInstanceStartTime} ->
         ?LOG_INFO("recording a checkpoint for ~s -> ~s at source update_seq ~p",
             [dbname(Source), dbname(Target), NewSeqNum]),
+        EndTime = ?l2b(httpd_util:rfc1123_date()),
+        StartTime = ?l2b(ReplicationStartTime),
+        DocsRead = ets:lookup_element(Stats, docs_read, 2),
+        DocsWritten = ets:lookup_element(Stats, docs_written, 2),
+        DocWriteFailures = ets:lookup_element(Stats, doc_write_failures, 2),
         NewHistoryEntry = {[
             {<<"session_id">>, SessionId},
-            {<<"start_time">>, list_to_binary(ReplicationStartTime)},
-            {<<"end_time">>, list_to_binary(httpd_util:rfc1123_date())},
+            {<<"start_time">>, StartTime},
+            {<<"end_time">>, EndTime},
             {<<"start_last_seq">>, StartSeqNum},
             {<<"end_last_seq">>, NewSeqNum},
             {<<"recorded_seq">>, NewSeqNum},
             {<<"missing_checked">>, ets:lookup_element(Stats, total_revs, 2)},
             {<<"missing_found">>, ets:lookup_element(Stats, missing_revs, 2)},
-            {<<"docs_read">>, ets:lookup_element(Stats, docs_read, 2)},
-            {<<"docs_written">>, ets:lookup_element(Stats, docs_written, 2)},
-            {<<"doc_write_failures">>,
-                ets:lookup_element(Stats, doc_write_failures, 2)}
+            {<<"docs_read">>, DocsRead},
+            {<<"docs_written">>, DocsWritten},
+            {<<"doc_write_failures">>, DocWriteFailures}
         ]},
-        % limit history to 50 entries
-        NewRepHistory = {[
+        BaseHistory = [
             {<<"session_id">>, SessionId},
-            {<<"source_last_seq">>, NewSeqNum},
-            {<<"history">>, lists:sublist([NewHistoryEntry | OldHistory], 50)}
-        ]},
+            {<<"source_last_seq">>, NewSeqNum}
+        ] ++ case couch_util:get_value(<<"doc_ids">>, RepDoc) of
+        undefined ->
+            [];
+        DocIds when is_list(DocIds) ->
+            % backwards compatibility with the result of a replication by
+            % doc IDs in versions 0.11.x and 1.0.x
+            [
+                {<<"start_time">>, StartTime},
+                {<<"end_time">>, EndTime},
+                {<<"docs_read">>, DocsRead},
+                {<<"docs_written">>, DocsWritten},
+                {<<"doc_write_failures">>, DocWriteFailures}
+            ]
+        end,
+        % limit history to 50 entries
+        NewRepHistory = {
+            BaseHistory ++
+            [{<<"history">>, lists:sublist([NewHistoryEntry | OldHistory], 50)}]
+        },
 
         try
         {SrcRevPos,SrcRevId} =
@@ -887,7 +882,7 @@ maybe_set_triggered({RepProps} = RepDoc, RepId) ->
 ensure_rep_db_exists() ->
     DbName = ?l2b(couch_config:get("replicator", "db", "_replicator")),
     Opts = [
-        {user_ctx, #user_ctx{roles=[<<"_admin">>, <<"_replicator">>]}},
+        {user_ctx, #user_ctx{roles=[<<"_admin">>]}},
         sys_db
     ],
     case couch_db:open(DbName, Opts) of
@@ -912,3 +907,27 @@ ensure_rep_ddoc_exists(RepDb, DDocID) ->
         {ok, _Rev} = couch_db:update_doc(RepDb, DDoc, [])
     end,
     ok.
+
+source_db_update_notifier(#db{name = DbName}) ->
+    Server = self(),
+    {ok, Notifier} = couch_db_update_notifier:start_link(
+        fun({compacted, DbName1}) when DbName1 =:= DbName ->
+                ok = gen_server:cast(Server, reopen_source_db);
+            (_) ->
+                ok
+        end),
+    Notifier;
+source_db_update_notifier(_) ->
+    nil.
+
+target_db_update_notifier(#db{name = DbName}) ->
+    Server = self(),
+    {ok, Notifier} = couch_db_update_notifier:start_link(
+        fun({compacted, DbName1}) when DbName1 =:= DbName ->
+                ok = gen_server:cast(Server, reopen_target_db);
+            (_) ->
+                ok
+        end),
+    Notifier;
+target_db_update_notifier(_) ->
+    nil.
